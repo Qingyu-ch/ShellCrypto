@@ -1,0 +1,26 @@
+# Build directories
+build-host/
+build-android/
+
+# Keys (NEVER commit)
+keys/
+
+# IDE
+.vscode/
+.idea/
+.vs
+*.user
+*.suo
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+CTestTestfile.cmake
