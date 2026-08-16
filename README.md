@@ -1,4 +1,6 @@
 # Android Shell Crypto
+[!]目前项目全部在安卓端运行，暂不支持纯Linux解密运行
+[!]目前项目处于开发模式，可能有bug，请提交issues
 
 通过 C++ 二进制保护 Android shell 脚本，防止他人轻易查看/篡改脚本原文。
 
@@ -175,4 +177,4 @@ androidshellcrypto/
 
 ## License
 
-MIT
+Apache-2.0 license
