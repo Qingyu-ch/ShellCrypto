@@ -9,36 +9,36 @@
 ```
 ┌──────────────────────────────────────────────────────────┐
 │                    PC / WSL 端 (开发)                      │
-│                                                          │
-│  example_script.sh ──► encrypt_bin ──► out.sh           │
+│                                                           │
+│  example_script.sh ──► encrypt_bin ──► out.sh          │
 │       │                    │                             │
-│       │                    ├─ decrypt_public.pem  (RSA)  │
-│       │                    └─ sign_private.pem    (RSA)  │
+│       │                    ├─ decrypt_public.pem  (RSA) │
+│       │                    └─ sign_private.pem    (RSA) │
 │       │                                                  │
 │       ▼                                                  │
-│  ┌─────────────────────────────────┐                     │
+│  ┌─────────────────────────────────┐                     
 │  │ out.sh (加密后)                  │                     │
 │  │  #!/system/bin/sh               │                     │
 │  │  exec decrypt_bin <base64>:<sig>│                     │
-│  └────────────┬────────────────────┘                     │
+│  └────────────┬────────────────────┘                     
 └───────────────┼──────────────────────────────────────────┘
                 │ adb push
                 ▼
 ┌──────────────────────────────────────────────────────────┐
 │                    Android 端 (运行)                       │
-│                                                          │
-│  out.sh ──► decrypt_bin (C++ 二进制)                      │
+│                                                           │
+│  out.sh ──► decrypt_bin (C++ 二进制)                     │
 │                  │                                       │
 │                  ├─ 验证签名 (内置 sign_public.pem)        │
 │                  ├─ RSA 解密 AES 密钥 (内置 decrypt_priv)  │
 │                  ├─ AES-256-CBC 解密脚本                  │
-│                  ├─ 写入 /data/local/tmp/.dec_XXXXXX.sh  │
+│                  ├─ 写入 /data/local/tmp/.dec_XXXXXX.sh   │
 │                  ├─ /system/bin/sh 执行                   │
 │                  └─ 删除临时文件                           │
-│                                                          │
-│  内置密钥 (编译时嵌入):                                    │
-│    - decrypt_private.pem  → 解密 AES 密钥                 │
-│    - sign_public.pem      → 验证签名                      │
+│                                                           │
+│  内置密钥 (编译时嵌入):                                      │
+│    - decrypt_private.pem  → 解密 AES 密钥                  │
+│    - sign_public.pem      → 验证签名                       │
 └──────────────────────────────────────────────────────────┘
 ```
 
