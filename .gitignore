@@ -2,8 +2,12 @@
 build-host/
 build-android/
 
+#include
+third_party/
+
 # Keys (NEVER commit)
 keys/
+
 
 # IDE
 .vscode/
@@ -20,6 +24,7 @@ Thumbs.db
 
 # CMake
 CMakeCache.txt
+CMakeListsLinux.txt
 CMakeFiles/
 cmake_install.cmake
 Makefile

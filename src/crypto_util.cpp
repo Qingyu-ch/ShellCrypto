@@ -14,7 +14,7 @@
 
 namespace crypto {
 
-    // ======================== 错误辅助 ========================
+    // mbedtls 错误码转异常
     static void throw_on_error(int ret, const char* ctx) {
         if (ret == 0) return;
         char buf[256];
@@ -22,7 +22,6 @@ namespace crypto {
         throw std::runtime_error(std::string(ctx) + " failed: " + buf);
     }
 
-    // ======================== Base64 ========================
     std::string base64_encode(const std::vector<uint8_t>& data) {
         size_t olen = 0;
         mbedtls_base64_encode(nullptr, 0, &olen, data.data(), data.size());
@@ -48,7 +47,7 @@ namespace crypto {
         return out;
     }
 
-    // ======================== 随机数 ========================
+    // 基于 CTR-DRBG 的安全随机数
     std::vector<uint8_t> random_bytes(size_t len) {
         std::vector<uint8_t> buf(len);
         mbedtls_entropy_context entropy;
@@ -69,7 +68,7 @@ namespace crypto {
         return buf;
     }
 
-    // ======================== AES-256-CBC ========================
+    // AES-256-CBC 加密，PKCS#7 填充，IV 随机生成
     AesResult aes256_encrypt(const std::vector<uint8_t>& plaintext,
         const std::vector<uint8_t>& key) {
         if (key.size() != 32) throw std::runtime_error("AES-256 key must be 32 bytes");
@@ -88,8 +87,10 @@ namespace crypto {
         int ret = mbedtls_aes_setkey_enc(&aes, key.data(), 256);
         throw_on_error(ret, "aes_setkey_enc");
 
+        // mbedtls_aes_crypt_cbc 会改写 IV，用副本保护原始 IV
+        std::vector<uint8_t> iv_copy = result.iv;
         ret = mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_ENCRYPT,
-            padded.size(), result.iv.data(),
+            padded.size(), iv_copy.data(),
             padded.data(), result.ciphertext.data());
         throw_on_error(ret, "aes_crypt_cbc encrypt");
 
@@ -124,7 +125,7 @@ namespace crypto {
         return padded;
     }
 
-    // ======================== RSA 加密 ========================
+    // RSA 公钥加密
     std::vector<uint8_t> rsa_encrypt(const std::vector<uint8_t>& plaintext,
         const std::string& pem_public_key) {
         mbedtls_pk_context pk;
@@ -159,7 +160,7 @@ namespace crypto {
         return out;
     }
 
-    // ======================== RSA 解密（只保留这一份） ========================
+    // RSA 私钥解密
     std::vector<uint8_t> rsa_decrypt(const std::vector<uint8_t>& ciphertext,
         const std::string& pem_private_key) {
         mbedtls_pk_context pk;
@@ -196,7 +197,6 @@ namespace crypto {
         return out;
     }
 
-    // ======================== HMAC-SHA256 ========================
     std::vector<uint8_t> hmac_sha256(const std::vector<uint8_t>& data,
         const std::vector<uint8_t>& key) {
         const mbedtls_md_info_t* md_info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
@@ -209,7 +209,7 @@ namespace crypto {
         return mac;
     }
 
-    // ======================== 密钥对生成 ========================
+    // 生成 RSA 密钥对，返回 PEM 字符串
     KeyPair generate_rsa_keypair(int bits) {
         mbedtls_pk_context pk;
         mbedtls_pk_init(&pk);
@@ -217,6 +217,7 @@ namespace crypto {
         mbedtls_entropy_context entropy;
         mbedtls_ctr_drbg_context ctr_drbg;
         mbedtls_entropy_init(&entropy);
+        mbedtls_ctr_drbg_init();
         mbedtls_ctr_drbg_init(&ctr_drbg);
 
         const char* pers = "keygen";
@@ -252,7 +253,7 @@ namespace crypto {
         return { priv_pem, pub_pem };
     }
 
-    // ======================== 打包 / 解包 ========================
+    // 二进制包格式: magic(4) + version(1) + reserved(3) + klen(2) + enc_aes_key(klen) + iv(16) + hmac(32) + clen(4) + ciphertext(clen)
     std::vector<uint8_t> pack_package(const EncryptedPackage& pkg) {
         std::vector<uint8_t> out;
         const char magic[4] = { 'A','S','C','E' };
@@ -278,37 +279,43 @@ namespace crypto {
 
     EncryptedPackage unpack_package(const std::vector<uint8_t>& data) {
         EncryptedPackage pkg;
-        size_t pos = 0;
-
         if (data.size() < 8 || memcmp(data.data(), "ASCE", 4) != 0)
             throw std::runtime_error("Invalid magic header");
-        pos += 4;
-
+        size_t pos = 4;
         uint8_t ver = data[pos++];
         if (ver != 0x01) throw std::runtime_error("Unsupported version");
         pos += 3;
 
+        if (pos + 2 > data.size()) throw std::runtime_error("Truncated: klen");
         uint16_t klen = (data[pos] << 8) | data[pos + 1];
         pos += 2;
+        if (pos + klen > data.size()) throw std::runtime_error("Truncated: enc_aes_key");
         pkg.enc_aes_key.assign(data.begin() + pos, data.begin() + pos + klen);
         pos += klen;
 
+        if (pos + 16 > data.size()) throw std::runtime_error("Truncated: iv");
         pkg.iv.assign(data.begin() + pos, data.begin() + pos + 16);
         pos += 16;
 
+        if (pos + 32 > data.size()) throw std::runtime_error("Truncated: hmac");
         pkg.hmac.assign(data.begin() + pos, data.begin() + pos + 32);
         pos += 32;
 
+        if (pos + 4 > data.size()) throw std::runtime_error("Truncated: clen");
         uint32_t clen = 0;
         for (int i = 0; i < 4; ++i) clen = (clen << 8) | data[pos + i];
         pos += 4;
-        pkg.ciphertext.assign(data.begin() + pos, data.begin() + pos + clen);
 
+        if (pos + clen != data.size())
+            throw std::runtime_error("Length mismatch: ciphertext");
+        if (clen % 16 != 0)
+            throw std::runtime_error("Ciphertext not 16-byte aligned");
+
+        pkg.ciphertext.assign(data.begin() + pos, data.begin() + pos + clen);
         return pkg;
     }
 
-    // ======================== 内置密钥 ========================
-    // 这两个常量由 embedded_keys.cpp 提供（CMake configure_file 注入）
+    // 内置密钥由 CMake configure_file 注入
     extern const char* EMBEDDED_DECRYPT_PRIVATE_KEY;
     extern const char* EMBEDDED_SIGN_PUBLIC_KEY;
 

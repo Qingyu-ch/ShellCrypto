@@ -1,22 +1,8 @@
 /*
- * decrypt_main.cpp - 解密并执行（Android 端二进制）
- *
- * 用法（由加密后的 shell 脚本自动调用）:
- *   decrypt_bin <base64_package>:<base64_signature> [extra_args...]
- *
- * 流程:
- *   1. 拆分参数，Base64 解码
- *   2. 用内置签名公钥验证签名 → 防复用/伪造
- *   3. 解包 → 用内置 RSA 私钥解密 AES 密钥
- *   4. AES-256-CBC 解密脚本
- *   5. 写临时文件 → 用 /system/bin/sh 执行
- *   6. 执行完毕删除临时文件
- *
- * 安全加固:
- *   - 私钥编译时内嵌（-D 宏注入）
- *   - 符号剥离（CMake POST_BUILD）
- *   - 防内存 dump：密钥使用后立即清零
- *   - 临时文件权限 700，执行后立即删除
+ * Android 端解密执行程序
+ * 用法: decrypt_bin <base64_package>:<base64_signature> [extra_args...]
+ *   or: decrypt_bin @<payload_file> [extra_args...]
+ *   or: 环境变量 DECRYPT_DATA=<base64_package>:<base64_signature>
  */
 
 #include "crypto_util.h"
@@ -24,6 +10,7 @@
 #include <mbedtls/pk.h>
 #include <mbedtls/md.h>
 #include <mbedtls/error.h>
+#include <sys/wait.h>
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -34,13 +21,124 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <algorithm>
+#include <cctype>
+#include <sys/types.h>
+#include <errno.h>
+#include <string.h>
+
+constexpr bool kDebugMode = true;
 
 using namespace crypto;
 
-// ======================== 签名验证 ========================
+// bionic 自带的 mkstemp 经常失败，这里自己实现一版
+extern "C" int mkstemp(char* tmpl) {
+    char* xxx = strstr(tmpl, "XXXXXX");
+    if (!xxx) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    static int counter = 0;
+    for (int attempt = 0; attempt < 1000; ++attempt) {
+        snprintf(xxx, 7, "%05d", (counter++ % 100000));
+        int fd = open(tmpl, O_CREAT | O_EXCL | O_RDWR, 0600);
+        if (fd >= 0) {
+            return fd;
+        }
+        if (errno != EEXIST) {
+            return -1;
+        }
+    }
+    errno = EEXIST;
+    return -1;
+}
+
+struct DecryptInput {
+    std::string b64_package;
+    std::string b64_signature;
+    std::vector<std::string> extra_args;
+};
+
+// 只保留 Base64 合法字符
+static std::string clean_b64(const std::string& raw) {
+    std::string result;
+    for (unsigned char c : raw) {
+        if (std::isalnum(c) || c == '+' || c == '/' || c == '=') {
+            result.push_back(c);
+        }
+    }
+    return result;
+}
+
+static DecryptInput parse_decrypt_args(int argc, char** argv) {
+    DecryptInput inp;
+    std::string first;
+
+    if (argc >= 2) {
+        std::string arg = argv[1];
+        // @file 语法：从文件读取 payload
+        if (arg.rfind("@", 0) == 0) {
+            std::string filepath = arg.substr(1);
+            std::ifstream f(filepath);
+            if (!f) {
+                std::cerr << "[-] Cannot read payload file: " << filepath << "\n";
+                exit(1);
+            }
+            std::stringstream ss;
+            ss << f.rdbuf();
+            first = ss.str();
+            while (!first.empty() && (first.back() == '\n' || first.back() == '\r'))
+                first.pop_back();
+            while (!first.empty() && (first.front() == '\n' || first.front() == '\r'))
+                first.erase(0, 1);
+        }
+        else {
+            first = arg;
+        }
+    }
+    else {
+        char* env = getenv("DECRYPT_DATA");
+        if (env) {
+            first = env;
+        }
+        else {
+            std::cerr << "Usage: decrypt_bin <base64_pkg>:<base64_sig> [args...]\n";
+            std::cerr << "   or decrypt_bin @<payload_file>\n";
+            std::cerr << "   or set env DECRYPT_DATA=<base64_pkg>:<base64_sig>\n";
+            exit(1);
+        }
+    }
+
+    size_t colon = first.find(':');
+    if (colon == std::string::npos) {
+        std::cerr << "[-] Invalid input format (missing ':' separator)\n";
+        exit(1);
+    }
+    inp.b64_package = clean_b64(first.substr(0, colon));
+    inp.b64_signature = clean_b64(first.substr(colon + 1));
+
+    // Base64 长度需为 4 的倍数，不足补 '='
+    auto pad_base64 = [](std::string& s) {
+        size_t rem = s.size() % 4;
+        if (rem > 0) {
+            s.append(4 - rem, '=');
+        }
+        };
+    pad_base64(inp.b64_package);
+    pad_base64(inp.b64_signature);
+
+    int arg_start = (argc >= 2) ? 2 : 1;
+    for (int i = arg_start; i < argc; ++i) {
+        inp.extra_args.emplace_back(argv[i]);
+    }
+    return inp;
+}
+
+// RSA 验签（SHA256）
 static bool rsa_verify(const std::vector<uint8_t>& data,
-                        const std::vector<uint8_t>& signature,
-                        const std::string& pem_sign_pubkey) {
+    const std::vector<uint8_t>& signature,
+    const std::string& pem_sign_pubkey) {
     mbedtls_pk_context pk;
     mbedtls_pk_init(&pk);
     int ret = mbedtls_pk_parse_public_key(
@@ -54,135 +152,217 @@ static bool rsa_verify(const std::vector<uint8_t>& data,
     mbedtls_md(md, data.data(), data.size(), hash.data());
 
     ret = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, hash.data(), hash.size(),
-                              signature.data(), signature.size());
+        signature.data(), signature.size());
     mbedtls_pk_free(&pk);
     return (ret == 0);
 }
 
-// ======================== 参数解析 ========================
-struct DecryptInput {
-    std::string b64_package;
-    std::string b64_signature;
-    std::vector<std::string> extra_args;
-};
+// fork + pipe：把解密后的脚本内容经 stdin 喂给 sh，避免写临时文件
+static int execute_script_via_pipe(const std::string& script_content,
+    const std::vector<std::string>& extra_args) {
 
-static DecryptInput parse_decrypt_args(int argc, char** argv) {
-    DecryptInput inp;
-    if (argc < 2) {
-        std::cerr << "Usage: decrypt_bin <base64_pkg>:<base64_sig> [args...]\n";
-        exit(1);
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        perror("pipe");
+        return 1;
     }
 
-    std::string first = argv[1];
-    size_t colon = first.find(':');
-    if (colon == std::string::npos) {
-        std::cerr << "[-] Invalid input format (missing ':' separator)\n";
-        exit(1);
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return 1;
     }
-    inp.b64_package   = first.substr(0, colon);
-    inp.b64_signature = first.substr(colon + 1);
 
-    for (int i = 2; i < argc; ++i) {
-        inp.extra_args.emplace_back(argv[i]);
-    }
-    return inp;
-}
+    if (pid == 0) {
+        // 子进程：管道读端接 stdin，执行 sh
+        close(pipefd[1]);
+        dup2(pipefd[0], STDIN_FILENO);
+        close(pipefd[0]);
 
-// ======================== 临时文件 ========================
-static std::string write_temp_script(const std::string& content) {
-    char tmpname[] = "/data/local/tmp/.dec_XXXXXX.sh";
-    int fd = mkstemp(tmpname);
-    if (fd < 0) { perror("mkstemp"); exit(1); }
-
-    // 权限 700
-    fchmod(fd, 0700);
-
-    ssize_t written = write(fd, content.data(), content.size());
-    if (written != (ssize_t)content.size()) { perror("write"); exit(1); }
-    close(fd);
-
-    return std::string(tmpname);
-}
-
-// ======================== 执行脚本 ========================
-static int execute_script(const std::string& script_path,
-                           const std::vector<std::string>& extra_args) {
-    // 构建命令行
-    std::string cmd = "/system/bin/sh \"" + script_path + "\"";
-
-    // 如果有额外参数，追加（简单处理，避免注入）
-    for (const auto& a : extra_args) {
-        cmd += " \"";
-        // 转义双引号
-        for (char c : a) {
-            if (c == '"') cmd += '\\';
-            cmd += c;
+        std::vector<char*> args;
+        args.push_back(const_cast<char*>("/system/bin/sh"));
+        for (const auto& a : extra_args) {
+            args.push_back(const_cast<char*>(a.c_str()));
         }
-        cmd += "\"";
+        args.push_back(nullptr);
+
+        std::cout << "[*] Executing decrypted script...\n";
+        execv("/system/bin/sh", args.data());
+
+        perror("execv");
+        _exit(127);
     }
+    else {
+        // 父进程：脚本内容写入管道
+        close(pipefd[0]);
 
-    std::cout << "[*] Executing decrypted script...\n";
-    int ret = system(cmd.c_str());
+        const char* data = script_content.data();
+        ssize_t total = script_content.size();
+        ssize_t written = 0;
+        while (written < total) {
+            ssize_t w = write(pipefd[1], data + written, total - written);
+            if (w < 0) {
+                perror("write");
+                break;
+            }
+            written += w;
+        }
+        close(pipefd[1]);
 
-    // 清理
-    unlink(script_path.c_str());
-    return ret;
+        int status;
+        waitpid(pid, &status, 0);
+        return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    }
 }
 
-// ======================== main ========================
 int main(int argc, char** argv) {
     DecryptInput inp = parse_decrypt_args(argc, argv);
 
     try {
-        // 1. Base64 解码
-        std::vector<uint8_t> package_bin = base64_decode(inp.b64_package);
-        std::vector<uint8_t> signature   = base64_decode(inp.b64_signature);
-
-        // 2. 获取内置密钥
         EmbeddedKey ek = get_embedded_key();
 
-        // 3. 验证签名（防复用/伪造）
+        // 1. Base64 解码
+        std::vector<uint8_t> package_bin, signature;
+        try {
+            package_bin = base64_decode(inp.b64_package);
+            signature = base64_decode(inp.b64_signature);
+        }
+        catch (...) {
+            std::cerr << "[-] base64_decode failed\n";
+            return 1;
+        }
+
+        if (kDebugMode) {
+            std::cerr << "[DEBUG] package_bin size: " << package_bin.size() << "\n";
+            std::cerr << "[DEBUG] package_bin hex: ";
+            for (auto b : package_bin) printf("%02x", b);
+            std::cerr << "\n";
+            std::cerr << "[DEBUG] signature size: " << signature.size() << "\n";
+        }
+
+        // 2. 验签
         if (!rsa_verify(package_bin, signature, ek.sign_public_pem)) {
-            std::cerr << "[-] Signature verification FAILED! Aborting.\n";
+            std::cerr << "[-] Signature verification FAILED\n";
             return 1;
         }
 
-        // 4. 解包
+        if (kDebugMode) {
+            std::cerr << "[DEBUG] Signature verification OK\n";
+        }
+
+        // 3. 解包
         EncryptedPackage pkg = unpack_package(package_bin);
+        if (kDebugMode) {
+            std::cerr << "[DEBUG] pkg.iv size: " << pkg.iv.size() << " hex: ";
+            for (auto b : pkg.iv) printf("%02x", b);
+            std::cerr << "\n";
+            std::cerr << "[DEBUG] pkg.ciphertext size: " << pkg.ciphertext.size() << "\n";
+            std::cerr << "[DEBUG] pkg.hmac size: " << pkg.hmac.size() << " hex: ";
+            for (auto b : pkg.hmac) printf("%02x", b);
+            std::cerr << "\n";
+            std::cerr << "[DEBUG] pkg.enc_aes_key size: " << pkg.enc_aes_key.size() << "\n";
+        }
 
-        // 5. RSA 解密 AES 密钥
+        // 4. RSA 解密 AES 密钥
         std::vector<uint8_t> aes_key = rsa_decrypt(pkg.enc_aes_key, ek.rsa_private_pem);
+        if (kDebugMode) {
+            std::cerr << "[DEBUG] aes_key size: " << aes_key.size() << " hex: ";
+            for (auto b : aes_key) printf("%02x", b);
+            std::cerr << "\n";
+        }
 
-        // 6. 验证 HMAC
-        std::vector<uint8_t> hmac_key = hmac_sha256(aes_key, std::vector<uint8_t>{'h','m','a','c'});
-        std::vector<uint8_t> expected_hmac = hmac_sha256(pkg.ciphertext, hmac_key);
-        if (expected_hmac != pkg.hmac) {
-            std::cerr << "[-] HMAC verification FAILED! Data corrupted.\n";
-            // 清零密钥
-            memset(aes_key.data(), 0, aes_key.size());
+        // 5. HMAC 校验
+        auto hmac_key = hmac_sha256(aes_key, { 'h','m','a','c' });
+        auto calc_hmac = hmac_sha256(pkg.ciphertext, hmac_key);
+        if (kDebugMode) {
+            std::cerr << "[DEBUG] calc_hmac hex: ";
+            for (auto b : calc_hmac) printf("%02x", b);
+            std::cerr << "\n";
+            std::cerr << "[DEBUG] expected hmac hex: ";
+            for (auto b : pkg.hmac) printf("%02x", b);
+            std::cerr << "\n";
+        }
+
+        if (calc_hmac != pkg.hmac) {
+            std::cerr << "[-] HMAC verification FAILED\n";
             return 1;
         }
 
-        // 7. AES 解密
+        if (kDebugMode) {
+            std::cerr << "[DEBUG] HMAC verification OK\n";
+        }
+
+        // 6. AES 解密
         std::vector<uint8_t> plaintext = aes256_decrypt(pkg.ciphertext, pkg.iv, aes_key);
+        if (kDebugMode) {
+            std::cerr << "[DEBUG] plaintext size: " << plaintext.size() << "\n";
+            std::cerr << "[DEBUG] plaintext hex: ";
+            for (auto b : plaintext) printf("%02x", b);
+            std::cerr << "\n";
+        }
 
-        // 立即清零 AES 密钥
-        memset(aes_key.data(), 0, aes_key.size());
-
-        // 8. 写入临时文件
+        // 7. 解密结果即 shell 脚本原文
         std::string script(plaintext.begin(), plaintext.end());
-        plaintext.clear();
-        memset(plaintext.data(), 0, plaintext.size());
 
-        std::string tmp_path = write_temp_script(script);
-        script.clear();
+        if (kDebugMode) {
+            std::cerr << "=== DECRYPTED SCRIPT BEGIN ===\n";
+            std::cerr << script;
+            std::cerr << "\n=== DECRYPTED SCRIPT END ===\n";
+        }
 
-        // 9. 执行
-        int ret = execute_script(tmp_path, inp.extra_args);
+        // 8. 管道方式直接交给 sh 执行
+        int pipefd[2];
+        if (pipe(pipefd) != 0) {
+            perror("pipe");
+            return 1;
+        }
 
-        return ret;
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            return 1;
+        }
 
-    } catch (const std::exception& e) {
+        if (pid == 0) {
+            close(pipefd[1]);
+            dup2(pipefd[0], STDIN_FILENO);
+            close(pipefd[0]);
+
+            std::vector<char*> args;
+            args.push_back(const_cast<char*>("/system/bin/sh"));
+            for (const auto& a : inp.extra_args) {
+                args.push_back(const_cast<char*>(a.c_str()));
+            }
+            args.push_back(nullptr);
+
+            std::cout << "[*] Executing decrypted script...\n";
+            execv("/system/bin/sh", args.data());
+            perror("execv");
+            _exit(127);
+        }
+        else {
+            close(pipefd[0]);
+
+            const char* data = script.data();
+            ssize_t total = script.size();
+            ssize_t written = 0;
+            while (written < total) {
+                ssize_t w = write(pipefd[1], data + written, total - written);
+                if (w < 0) {
+                    perror("write");
+                    break;
+                }
+                written += w;
+            }
+            close(pipefd[1]);
+
+            int status;
+            waitpid(pid, &status, 0);
+            return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+        }
+
+    }
+    catch (const std::exception& e) {
         std::cerr << "[-] Decrypt error: " << e.what() << std::endl;
         return 1;
     }
