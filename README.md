@@ -1,43 +1,47 @@
 # Android Shell Crypto
+[!]目前项目全部在安卓端运行，暂不支持纯Linux解密运行          
+[!]目前项目处于开发模式，可能有bug，请提交Issues        
+[!]包含AI生成的代码，遇到问题请立即提交Issues
 
-通过 C++ 二进制保护 Android shell 脚本，防止他人轻易查看/篡改脚本原文。
+
+通过 C++ 二进制保护 Android shell 脚本，防止他人轻易查看/篡改脚本原文
 
 ## 架构
 
 ```
-┌──────────────────────────────────────────────────────────┐
+┌───────────────────────────────────┐
 │                    PC / WSL 端 (开发)                      │
-│                                                          │
-│  example_script.sh ──► encrypt_bin ──► out.sh           │
+│                                                           │
+│  example_script.sh ──► encrypt_bin ──► out.sh          │
 │       │                    │                             │
-│       │                    ├─ decrypt_public.pem  (RSA)  │
-│       │                    └─ sign_private.pem    (RSA)  │
+│       │                    ├─ decrypt_public.pem  (RSA) │
+│       │                    └─ sign_private.pem    (RSA) │
 │       │                                                  │
 │       ▼                                                  │
-│  ┌─────────────────────────────────┐                     │
-│  │ out.sh (加密后)                  │                     │
-│  │  #!/system/bin/sh               │                     │
-│  │  exec decrypt_bin <base64>:<sig>│                     │
-│  └────────────┬────────────────────┘                     │
-└───────────────┼──────────────────────────────────────────┘
-                │ adb push
-                ▼
-┌──────────────────────────────────────────────────────────┐
+│  ┌────────────────────┐                    │
+│  │ out.sh (加密后)                  │                    │
+│  │  #!/system/bin/sh               │                    │
+│  │  exec decrypt_bin <base64>:<sig>│                    │
+│  └────────────┬───────┘                    │ 
+└──────────────┼────────────────────┘
+                adb push │ 
+                         ▼
+┌───────────────────────────────────┐
 │                    Android 端 (运行)                       │
-│                                                          │
-│  out.sh ──► decrypt_bin (C++ 二进制)                      │
+│                                                           │
+│  out.sh ──► decrypt_bin (C++ 二进制)                     │
 │                  │                                       │
 │                  ├─ 验证签名 (内置 sign_public.pem)        │
 │                  ├─ RSA 解密 AES 密钥 (内置 decrypt_priv)  │
 │                  ├─ AES-256-CBC 解密脚本                  │
-│                  ├─ 写入 /data/local/tmp/.dec_XXXXXX.sh  │
+│                  ├─ 写入 /data/local/tmp/.dec_XXXXXX.sh   │
 │                  ├─ /system/bin/sh 执行                   │
 │                  └─ 删除临时文件                           │
-│                                                          │
-│  内置密钥 (编译时嵌入):                                    │
-│    - decrypt_private.pem  → 解密 AES 密钥                 │
-│    - sign_public.pem      → 验证签名                      │
-└──────────────────────────────────────────────────────────┘
+│                                                           │
+│  内置密钥 (编译时嵌入):                                      │
+│    - decrypt_private.pem  → 解密 AES 密钥                  │
+│    - sign_public.pem      → 验证签名                       │
+└────────────────────────────────────┘
 ```
 
 ## 安全模型
@@ -175,4 +179,4 @@ androidshellcrypto/
 
 ## License
 
-MIT
+Apache-2.0 license
