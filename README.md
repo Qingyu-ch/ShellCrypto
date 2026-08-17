@@ -1,7 +1,5 @@
 # Android Shell Crypto
-[!]目前项目Release全部在安卓端运行，暂纯Linux解密需要自行编译运行，结尾增加参数保证输出正确：
-decrypt_bin <input> [extra_args...] [--output <file>]
-      
+  
 [!]包含AI生成的代码，遇到问题请立即提交Issues
 
 
