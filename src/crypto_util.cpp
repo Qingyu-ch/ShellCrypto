@@ -217,7 +217,6 @@ namespace crypto {
         mbedtls_entropy_context entropy;
         mbedtls_ctr_drbg_context ctr_drbg;
         mbedtls_entropy_init(&entropy);
-        mbedtls_ctr_drbg_init();
         mbedtls_ctr_drbg_init(&ctr_drbg);
 
         const char* pers = "keygen";

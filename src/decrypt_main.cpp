@@ -3,14 +3,22 @@
  * 用法: decrypt_bin <base64_package>:<base64_signature> [extra_args...]
  *   or: decrypt_bin @<payload_file> [extra_args...]
  *   or: 环境变量 DECRYPT_DATA=<base64_package>:<base64_signature>
+ * 新增: --output <file>  将解密后的脚本写入文件而非直接执行
  */
 
 #include "crypto_util.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#include <process.h>
+#else
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 #include <mbedtls/pk.h>
 #include <mbedtls/md.h>
 #include <mbedtls/error.h>
-#include <sys/wait.h>
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -18,7 +26,6 @@
 #include <vector>
 #include <cstring>
 #include <cstdlib>
-#include <unistd.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <algorithm>
@@ -58,6 +65,7 @@ struct DecryptInput {
     std::string b64_package;
     std::string b64_signature;
     std::vector<std::string> extra_args;
+    std::string output_path;   // 新增：输出文件路径，为空则不输出文件
 };
 
 // 只保留 Base64 合法字符
@@ -75,8 +83,28 @@ static DecryptInput parse_decrypt_args(int argc, char** argv) {
     DecryptInput inp;
     std::string first;
 
-    if (argc >= 2) {
-        std::string arg = argv[1];
+    // 新增：解析 --output 参数
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
+            inp.output_path = argv[++i];
+            // 标记该参数已被消费，后续不再作为 payload 或 extra_args
+            argv[i - 1] = nullptr;
+            argv[i] = nullptr;
+        }
+    }
+
+    // 收集剩余的非空参数
+    std::vector<char*> remaining;
+    for (int i = 1; i < argc; ++i) {
+        if (argv[i] != nullptr) {
+            remaining.push_back(argv[i]);
+        }
+    }
+    int remaining_argc = (int)remaining.size();
+    char** remaining_argv = remaining.data();
+
+    if (remaining_argc >= 1) {
+        std::string arg = remaining_argv[0];
         // @file 语法：从文件读取 payload
         if (arg.rfind("@", 0) == 0) {
             std::string filepath = arg.substr(1);
@@ -106,6 +134,8 @@ static DecryptInput parse_decrypt_args(int argc, char** argv) {
             std::cerr << "Usage: decrypt_bin <base64_pkg>:<base64_sig> [args...]\n";
             std::cerr << "   or decrypt_bin @<payload_file>\n";
             std::cerr << "   or set env DECRYPT_DATA=<base64_pkg>:<base64_sig>\n";
+            std::cerr << "Options:\n";
+            std::cerr << "  --output <file>   Write decrypted script to file instead of executing\n";
             exit(1);
         }
     }
@@ -128,9 +158,10 @@ static DecryptInput parse_decrypt_args(int argc, char** argv) {
     pad_base64(inp.b64_package);
     pad_base64(inp.b64_signature);
 
-    int arg_start = (argc >= 2) ? 2 : 1;
-    for (int i = arg_start; i < argc; ++i) {
-        inp.extra_args.emplace_back(argv[i]);
+    // 剩余参数作为 extra_args（跳过第一个 payload 参数）
+    int arg_start = (remaining_argc >= 1) ? 1 : 0;
+    for (int i = arg_start; i < remaining_argc; ++i) {
+        inp.extra_args.emplace_back(remaining_argv[i]);
     }
     return inp;
 }
@@ -310,55 +341,70 @@ int main(int argc, char** argv) {
             std::cerr << "\n=== DECRYPTED SCRIPT END ===\n";
         }
 
-        // 8. 管道方式直接交给 sh 执行
-        int pipefd[2];
-        if (pipe(pipefd) != 0) {
-            perror("pipe");
-            return 1;
-        }
-
-        pid_t pid = fork();
-        if (pid < 0) {
-            perror("fork");
-            return 1;
-        }
-
-        if (pid == 0) {
-            close(pipefd[1]);
-            dup2(pipefd[0], STDIN_FILENO);
-            close(pipefd[0]);
-
-            std::vector<char*> args;
-            args.push_back(const_cast<char*>("/system/bin/sh"));
-            for (const auto& a : inp.extra_args) {
-                args.push_back(const_cast<char*>(a.c_str()));
+        // 8. 根据是否指定 --output 决定写入文件还是管道执行
+        if (!inp.output_path.empty()) {
+            // 写入文件
+            std::ofstream out(inp.output_path, std::ios::binary);
+            if (!out) {
+                std::cerr << "[-] Cannot write output file: " << inp.output_path << "\n";
+                return 1;
             }
-            args.push_back(nullptr);
-
-            std::cout << "[*] Executing decrypted script...\n";
-            execv("/system/bin/sh", args.data());
-            perror("execv");
-            _exit(127);
+            out << script;
+            out.close();
+            std::cout << "[+] Decrypted script saved to: " << inp.output_path << "\n";
+            return 0;
         }
         else {
-            close(pipefd[0]);
-
-            const char* data = script.data();
-            ssize_t total = script.size();
-            ssize_t written = 0;
-            while (written < total) {
-                ssize_t w = write(pipefd[1], data + written, total - written);
-                if (w < 0) {
-                    perror("write");
-                    break;
-                }
-                written += w;
+            // 管道方式直接交给 sh 执行
+            int pipefd[2];
+            if (pipe(pipefd) != 0) {
+                perror("pipe");
+                return 1;
             }
-            close(pipefd[1]);
 
-            int status;
-            waitpid(pid, &status, 0);
-            return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+            pid_t pid = fork();
+            if (pid < 0) {
+                perror("fork");
+                return 1;
+            }
+
+            if (pid == 0) {
+                close(pipefd[1]);
+                dup2(pipefd[0], STDIN_FILENO);
+                close(pipefd[0]);
+
+                std::vector<char*> args;
+                args.push_back(const_cast<char*>("/system/bin/sh"));
+                for (const auto& a : inp.extra_args) {
+                    args.push_back(const_cast<char*>(a.c_str()));
+                }
+                args.push_back(nullptr);
+
+                std::cout << "[*] Executing decrypted script...\n";
+                execv("/system/bin/sh", args.data());
+                perror("execv");
+                _exit(127);
+            }
+            else {
+                close(pipefd[0]);
+
+                const char* data = script.data();
+                ssize_t total = script.size();
+                ssize_t written = 0;
+                while (written < total) {
+                    ssize_t w = write(pipefd[1], data + written, total - written);
+                    if (w < 0) {
+                        perror("write");
+                        break;
+                    }
+                    written += w;
+                }
+                close(pipefd[1]);
+
+                int status;
+                waitpid(pid, &status, 0);
+                return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+            }
         }
 
     }
